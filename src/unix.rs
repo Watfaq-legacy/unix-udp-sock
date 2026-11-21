@@ -25,23 +25,22 @@ use super::{cmsg, log_sendmsg_error, RecvMeta, UdpState, IO_ERROR_LOG_INTERVAL};
 pub(crate) const BATCH_SIZE_CAP: usize = SYS_BATCH_SIZE_CAP;
 
 // This is not set to the maximum as larger batch sizes require larger stack
-// frames, which may be undesirable. On non-Linux/FreeBSD systems, this is
-// reduced to 1, as they don't support batching UDP messages.
+// frames, which may be undesirable. Platforms without batch support use 1.
 pub(crate) const DEFAULT_BATCH_SIZE: usize = SYS_DEFAULT_BATCH_SIZE;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const SYS_BATCH_SIZE_CAP: usize = libc::UIO_MAXIOV as usize;
 
 #[cfg(target_os = "freebsd")]
 const SYS_BATCH_SIZE_CAP: usize = 1024 as usize;
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
 pub const SYS_BATCH_SIZE_CAP: usize = 1;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 pub const SYS_DEFAULT_BATCH_SIZE: usize = 128;
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
 pub const SYS_DEFAULT_BATCH_SIZE: usize = 1;
 
 #[cfg(target_os = "freebsd")]
@@ -139,8 +138,8 @@ impl UdpSocket {
     }
 
     /// Opportunistically try to enable GRO support for this socket. This is
-    /// only supported on Linux platforms.
-    #[cfg(target_os = "linux")]
+    /// supported on Linux and Android.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn set_gro(&self, enable: bool) -> io::Result<()> {
         // See gro::gro_segments().
         const OPTION_OFF: libc::c_int = 0;
@@ -381,7 +380,7 @@ impl UdpSocket {
         loop {
             ready!(self.io.poll_send_ready(cx))?;
             let io = &self.io;
-            if let Ok(res) = io.try_io(Interest::WRITABLE, || {
+            match io.try_io(Interest::WRITABLE, || {
                 send::<_, BATCH_SIZE>(
                     state,
                     SockRef::from(io),
@@ -389,7 +388,8 @@ impl UdpSocket {
                     transmits,
                 )
             }) {
-                return Poll::Ready(Ok(res));
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
             }
         }
     }
@@ -404,10 +404,11 @@ impl UdpSocket {
         loop {
             ready!(self.io.poll_send_ready(cx))?;
             let io = &self.io;
-            if let Ok(res) = io.try_io(Interest::WRITABLE, || {
+            match io.try_io(Interest::WRITABLE, || {
                 send_msg(state, SockRef::from(io), &transmits)
             }) {
-                return Poll::Ready(Ok(res));
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
             }
         }
     }
@@ -421,8 +422,9 @@ impl UdpSocket {
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
             let io = &self.io;
-            if let Ok(res) = io.try_io(Interest::READABLE, || recv_msg(SockRef::from(io), buf)) {
-                return Poll::Ready(Ok(res));
+            match io.try_io(Interest::READABLE, || recv_msg(SockRef::from(io), buf)) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
             }
         }
     }
@@ -448,10 +450,11 @@ impl UdpSocket {
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
             let io = &self.io;
-            if let Ok(res) = io.try_io(Interest::READABLE, || {
+            match io.try_io(Interest::READABLE, || {
                 recv::<BATCH_SIZE>(SockRef::from(io), bufs, meta)
             }) {
-                return Poll::Ready(Ok(res));
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
             }
         }
     }
@@ -694,7 +697,10 @@ const OPTION_ON: libc::c_int = 1;
 
 fn init(io: SockRef<'_>) -> io::Result<()> {
     let mut cmsg_platform_space = 0;
-    if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") || cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "linux", target_os = "android"))
+        || cfg!(target_os = "freebsd")
+        || cfg!(target_os = "macos")
+    {
         cmsg_platform_space +=
             unsafe { libc::CMSG_SPACE(mem::size_of::<libc::in6_pktinfo>() as _) as usize };
     }
@@ -718,7 +724,7 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
     if is_ipv4 || ((!cfg!(any(target_os = "macos", target_os = "ios"))) && !io.only_v6()?) {
         set_socket_option(&*io, libc::IPPROTO_IP, libc::IP_RECVTOS, OPTION_ON)?;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // Forbid IPv4 fragmentation. Set even for IPv6 to account for IPv6 mapped IPv4 addresses.
         set_socket_option(
@@ -771,7 +777,7 @@ fn send_msg<B: AsPtr<u8>>(
 
     let addr = socket2::SockAddr::from(transmit.dst);
     let dst_addr = &addr;
-    prepare_msg(transmit, dst_addr, &mut msg_hdr, &mut iovec, &mut cmsg);
+    prepare_msg(transmit, dst_addr, &mut msg_hdr, &mut iovec, &mut cmsg)?;
 
     loop {
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &msg_hdr, 0) };
@@ -787,7 +793,7 @@ fn send_msg<B: AsPtr<u8>>(
                     // Some network adapters do not support GSO. Unfortunately, Linux offers no easy way
                     // for us to detect this short of an I/O error when we try to actually send
                     // datagrams using it.
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     if e.raw_os_error() == Some(libc::EIO) {
                         // Prevent new transmits from being scheduled using GSO. Existing GSO transmits
                         // may already be in the pipeline, so we need to tolerate additional failures.
@@ -851,12 +857,12 @@ fn send<B: AsPtr<u8>, const BATCH_SIZE: usize>(
             &mut msgs[i].msg_hdr,
             &mut iovecs[i],
             &mut cmsgs[i],
-        );
+        )?;
     }
     let num_transmits = transmits.len().min(BATCH_SIZE);
 
     loop {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let n =
             unsafe { libc::sendmmsg(io.as_raw_fd(), msgs.as_mut_ptr(), num_transmits as u32, 0) };
         #[cfg(target_os = "freebsd")]
@@ -874,7 +880,7 @@ fn send<B: AsPtr<u8>, const BATCH_SIZE: usize>(
                     // Some network adapters do not support GSO. Unfortunately, Linux offers no easy way
                     // for us to detect this short of an I/O error when we try to actually send
                     // datagrams using it.
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     if e.raw_os_error() == Some(libc::EIO) {
                         // Prevent new transmits from being scheduled using GSO. Existing GSO transmits
                         // may already be in the pipeline, so we need to tolerate additional failures.
@@ -918,7 +924,7 @@ fn send_msg<B: AsPtr<u8>>(
 
     let addr = socket2::SockAddr::from(transmit.dst);
     let dst_addr = &addr;
-    prepare_msg(transmit, dst_addr, &mut hdr, &mut iov, &mut ctrl);
+    prepare_msg(transmit, dst_addr, &mut hdr, &mut iov, &mut ctrl)?;
 
     loop {
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) };
@@ -958,7 +964,7 @@ fn send<B: AsPtr<u8>, const BATCH_SIZE: usize>(
     let mut sent = 0;
     while sent < transmits.len() {
         let addr = socket2::SockAddr::from(transmits[sent].dst);
-        prepare_msg(&transmits[sent], &addr, &mut hdr, &mut iov, &mut ctrl);
+        prepare_msg(&transmits[sent], &addr, &mut hdr, &mut iov, &mut ctrl)?;
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) };
         if n == -1 {
             let e = io::Error::last_os_error();
@@ -1007,7 +1013,7 @@ fn recv<const BATCH_SIZE: usize>(
         );
     }
     let msg_count = loop {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let n = unsafe {
             libc::recvmmsg(
                 io.as_raw_fd(),
@@ -1128,13 +1134,23 @@ pub fn udp_state() -> UdpState {
 
 const CMSG_LEN: usize = 512;
 
+// libc uses different integer types for packet-info indices across platforms.
+fn encode_ifindex<T: TryFrom<u32>>(index: u32) -> io::Result<T> {
+    T::try_from(index)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface index out of range"))
+}
+
+fn decode_ifindex<T: TryInto<u32>>(index: T) -> u32 {
+    index.try_into().unwrap_or_default()
+}
+
 fn prepare_msg<B: AsPtr<u8>>(
     transmit: &Transmit<B>,
     dst_addr: &socket2::SockAddr,
     hdr: &mut libc::msghdr,
     iov: &mut libc::iovec,
     ctrl: &mut cmsg::Aligned<[u8; CMSG_LEN]>,
-) {
+) -> io::Result<()> {
     iov.iov_base = transmit.contents.as_ptr() as *const _ as *mut _;
     iov.iov_len = transmit.contents.len();
 
@@ -1167,7 +1183,7 @@ fn prepare_msg<B: AsPtr<u8>>(
     if let Some(ip) = &transmit.src {
         match ip {
             Source::Ip(IpAddr::V4(v4)) => {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
                 {
                     let pktinfo = libc::in_pktinfo {
                         ipi_ifindex: 0,
@@ -1198,7 +1214,7 @@ fn prepare_msg<B: AsPtr<u8>>(
             #[cfg(not(target_os = "freebsd"))]
             Source::Interface(i) => {
                 let pktinfo = libc::in_pktinfo {
-                    ipi_ifindex: *i as _, // i32 linux, u32 mac
+                    ipi_ifindex: encode_ifindex(*i)?,
                     ipi_spec_dst: libc::in_addr { s_addr: 0 },
                     ipi_addr: libc::in_addr { s_addr: 0 },
                 };
@@ -1208,7 +1224,7 @@ fn prepare_msg<B: AsPtr<u8>>(
             Source::Interface(_) => (), // Not yet supported on FreeBSD
             Source::InterfaceV6(i, ip) => {
                 let pktinfo = libc::in6_pktinfo {
-                    ipi6_ifindex: *i,
+                    ipi6_ifindex: encode_ifindex(*i)?,
                     ipi6_addr: libc::in6_addr {
                         s6_addr: ip.octets(),
                     },
@@ -1219,6 +1235,7 @@ fn prepare_msg<B: AsPtr<u8>>(
     }
 
     encoder.finish();
+    Ok(())
 }
 
 fn prepare_recv(
@@ -1271,7 +1288,7 @@ fn decode_recv(
                     ecn_bits = cmsg::decode::<libc::c_int>(cmsg) as u8;
                 }
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in_pktinfo>(cmsg) };
                 dst_ip = Some(IpAddr::V4(Ipv4Addr::from(
@@ -1280,7 +1297,7 @@ fn decode_recv(
                 dst_local_ip = Some(IpAddr::V4(Ipv4Addr::from(
                     pktinfo.ipi_spec_dst.s_addr.to_ne_bytes(),
                 )));
-                ifindex = pktinfo.ipi_ifindex as _;
+                ifindex = decode_ifindex(pktinfo.ipi_ifindex);
             }
             #[cfg(any(target_os = "freebsd", target_os = "macos"))]
             (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
@@ -1292,25 +1309,25 @@ fn decode_recv(
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in6_pktinfo>(cmsg) };
                 dst_ip = Some(IpAddr::V6(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr)));
-                ifindex = pktinfo.ipi6_ifindex;
+                ifindex = decode_ifindex(pktinfo.ipi6_ifindex);
             }
             #[cfg(any(target_os = "freebsd", target_os = "macos"))]
             (libc::IPPROTO_IP, libc::IP_RECVIF) => {
                 let info = unsafe { cmsg::decode::<libc::sockaddr_dl>(cmsg) };
                 ifindex = info.sdl_index as _;
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::SOL_UDP, libc::UDP_GRO) => unsafe {
                 stride = cmsg::decode::<libc::c_int>(cmsg) as usize;
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::SOL_IP, libc::IP_ORIGDSTADDR) => unsafe {
                 let addr_in = cmsg::decode::<libc::sockaddr_in>(cmsg);
                 let addr = Ipv4Addr::from(addr_in.sin_addr.s_addr.to_ne_bytes());
                 let port = u16::from_be(addr_in.sin_port);
                 orig_dst = Some(SocketAddr::V4(SocketAddrV4::new(addr, port)));
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::SOL_IPV6, libc::IPV6_ORIGDSTADDR) => unsafe {
                 let addr_in = cmsg::decode::<libc::sockaddr_in6>(cmsg);
                 let addr = Ipv6Addr::from(addr_in.sin6_addr.s6_addr);
@@ -1360,7 +1377,7 @@ fn decode_recv(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod gso {
     use super::*;
 
@@ -1389,7 +1406,7 @@ mod gso {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod gso {
     use super::*;
 
@@ -1402,7 +1419,7 @@ mod gso {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod gro {
     use super::*;
 
@@ -1438,9 +1455,62 @@ mod gro {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod gro {
     pub fn gro_segments() -> usize {
         1
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod original_destination_tests {
+    use super::*;
+    use std::{net::UdpSocket as StdSocket, time::Duration};
+
+    fn check_original_destination(ip: IpAddr, level: i32, option: i32) -> io::Result<()> {
+        let receiver = StdSocket::bind((ip, 0))?;
+        receiver.set_read_timeout(Some(Duration::from_secs(3)))?;
+        set_socket_option(&receiver, level, option, OPTION_ON)?;
+        let receiver = sync::UdpSocket::from_std(receiver)?;
+        let sender = StdSocket::bind((ip, 0))?;
+        let dst = receiver.local_addr()?;
+        sender.send_to(b"udp", dst)?;
+        let mut buf = [0; 16];
+        let meta = receiver.recv_msg(&mut buf)?;
+        assert_eq!(meta.orig_dst, Some(dst));
+        assert_eq!(meta.addr, sender.local_addr()?);
+        assert_eq!(&buf[..meta.len], b"udp");
+        Ok(())
+    }
+
+    #[test]
+    fn ipv4_original_destination() -> io::Result<()> {
+        check_original_destination(
+            Ipv4Addr::LOCALHOST.into(),
+            libc::IPPROTO_IP,
+            libc::IP_RECVORIGDSTADDR,
+        )
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn ipv6_interface_index_out_of_range() -> io::Result<()> {
+        let socket = sync::UdpSocket::bind("[::1]:0")?;
+        let tx = Transmit::new(socket.local_addr()?, *b"test")
+            .src_ip(Source::InterfaceV6(u32::MAX, Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            socket.send_msg(&UdpState::new(), tx).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ipv6_original_destination() -> io::Result<()> {
+        check_original_destination(
+            Ipv6Addr::LOCALHOST.into(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_RECVORIGDSTADDR,
+        )
     }
 }
