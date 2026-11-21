@@ -1,13 +1,15 @@
 #![allow(clippy::unnecessary_cast)]
 use std::{
-    io,
-    io::IoSliceMut,
+    io::{self, IoSliceMut},
     mem::{self, MaybeUninit},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    os::unix::io::AsRawFd,
-    sync::atomic::AtomicUsize,
+    os::{fd::AsFd, unix::io::AsRawFd},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
-    time::Instant,
+    time::SystemTime,
 };
 
 use crate::cmsg::{AsPtr, EcnCodepoint, Source, Transmit};
@@ -19,6 +21,28 @@ use tokio::{
 };
 
 use super::{cmsg, log_sendmsg_error, RecvMeta, UdpState, IO_ERROR_LOG_INTERVAL};
+
+pub(crate) const BATCH_SIZE_CAP: usize = SYS_BATCH_SIZE_CAP;
+
+// This is not set to the maximum as larger batch sizes require larger stack
+// frames, which may be undesirable. On non-Linux/FreeBSD systems, this is
+// reduced to 1, as they don't support batching UDP messages.
+pub(crate) const DEFAULT_BATCH_SIZE: usize = SYS_DEFAULT_BATCH_SIZE;
+
+#[cfg(target_os = "linux")]
+const SYS_BATCH_SIZE_CAP: usize = libc::UIO_MAXIOV as usize;
+
+#[cfg(target_os = "freebsd")]
+const SYS_BATCH_SIZE_CAP: usize = 1024 as usize;
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+pub const SYS_BATCH_SIZE_CAP: usize = 1;
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub const SYS_DEFAULT_BATCH_SIZE: usize = 128;
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+pub const SYS_DEFAULT_BATCH_SIZE: usize = 1;
 
 #[cfg(target_os = "freebsd")]
 type IpTosTy = libc::c_uchar;
@@ -32,12 +56,54 @@ type IpTosTy = libc::c_int;
 #[derive(Debug)]
 pub struct UdpSocket {
     io: tokio::net::UdpSocket,
-    last_send_error: Instant,
+    last_send_error: LastSendError,
 }
 
 impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
         self.io.as_raw_fd()
+    }
+}
+
+impl AsFd for UdpSocket {
+    fn as_fd(&self) -> std::os::unix::prelude::BorrowedFd<'_> {
+        self.io.as_fd()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LastSendError(Arc<AtomicU64>);
+
+impl Default for LastSendError {
+    fn default() -> Self {
+        let now = Self::now();
+        Self(Arc::new(AtomicU64::new(
+            now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
+        )))
+    }
+}
+
+impl LastSendError {
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Determine whether the last error was more than `IO_ERROR_LOG_INTERVAL`
+    /// seconds ago. If so, update the last error time and return true.
+    ///
+    /// Note: if the system clock regresses more tha `IO_ERROR_LOG_INTERVAL`,
+    /// this function may impose an additional delay on log message emission.
+    /// Similarly, if it advances, messages may be emitted prematurely.
+    pub(crate) fn should_log(&self) -> bool {
+        let now = Self::now();
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                (now.saturating_sub(cur) > IO_ERROR_LOG_INTERVAL).then_some(now)
+            })
+            .is_ok()
     }
 }
 
@@ -47,10 +113,9 @@ impl UdpSocket {
         socket.set_nonblocking(true)?;
 
         init(SockRef::from(&socket))?;
-        let now = Instant::now();
         Ok(UdpSocket {
             io: tokio::net::UdpSocket::from_std(socket)?,
-            last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
+            last_send_error: LastSendError::default(),
         })
     }
 
@@ -62,16 +127,26 @@ impl UdpSocket {
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         let io = tokio::net::UdpSocket::bind(addr).await?;
         init(SockRef::from(&io))?;
-        let now = Instant::now();
         Ok(UdpSocket {
             io,
-            last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
+            last_send_error: LastSendError::default(),
         })
     }
 
     /// sets the value of SO_BROADCAST for this socket
     pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         self.io.set_broadcast(broadcast)
+    }
+
+    /// Opportunistically try to enable GRO support for this socket. This is
+    /// only supported on Linux platforms.
+    #[cfg(target_os = "linux")]
+    pub fn set_gro(&self, enable: bool) -> io::Result<()> {
+        // See gro::gro_segments().
+        const OPTION_OFF: libc::c_int = 0;
+
+        let value = if enable { OPTION_ON } else { OPTION_OFF };
+        set_socket_option(&self.io, libc::SOL_UDP, libc::UDP_GRO, value)
     }
 
     pub async fn connect<A: ToSocketAddrs>(&self, addrs: A) -> io::Result<()> {
@@ -141,7 +216,7 @@ impl UdpSocket {
     /// See tokio [`poll_send`]
     ///
     /// [`poll_send`]: method@tokio::net::UdpSocket::poll_send
-    pub async fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    pub fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.io.poll_send(cx, buf)
     }
     /// Receives a single datagram message on the socket. On success, returns
@@ -186,25 +261,46 @@ impl UdpSocket {
     }
 
     /// Calls syscall [`sendmmsg`]. With a given `state` configured GSO and
-    /// `transmits` with information on the data and metadata about outgoing packets.
+    /// `transmits` with information on the data and metadata about outgoing
+    /// packets.
+    ///
+    /// Utilizes the default batch size (`DEFAULT_BATCH_SIZE`), and will send no
+    /// more than that number of messages. The caller must call this fuction
+    /// again after modifying `transmits` to continue sending the entire set of
+    /// messages.
     ///
     /// [`sendmmsg`]: https://linux.die.net/man/2/sendmmsg
     pub async fn send_mmsg<B: AsPtr<u8>>(
-        &mut self,
+        &self,
         state: &UdpState,
         transmits: &[Transmit<B>],
     ) -> Result<usize, io::Error> {
-        let n = loop {
-            self.io.writable().await?;
-            let last_send_error = &mut self.last_send_error;
-            let io = &self.io;
-            match io.try_io(Interest::WRITABLE, || {
-                send(state, SockRef::from(io), last_send_error, transmits)
-            }) {
-                Ok(res) => break res,
-                Err(_would_block) => continue,
-            }
-        };
+        self.send_mmsg_with_batch_size::<_, DEFAULT_BATCH_SIZE>(state, transmits)
+            .await
+    }
+
+    /// Calls syscall [`sendmmsg`]. With a given `state` configured GSO and
+    /// `transmits` with information on the data and metadata about outgoing packets.
+    ///
+    /// Sends no more than `BATCH_SIZE` messages. The caller must call this
+    /// fuction again after modifying `transmits` to continue sending the entire
+    /// set of messages.  `BATCH_SIZE_CAP` defines the maximum that will be
+    /// sent, regardless of the specified `BATCH_SIZE`
+    ///
+    /// [`sendmmsg`]: https://linux.die.net/man/2/sendmmsg
+    pub async fn send_mmsg_with_batch_size<B: AsPtr<u8>, const BATCH_SIZE: usize>(
+        &self,
+        state: &UdpState,
+        transmits: &[Transmit<B>],
+    ) -> Result<usize, io::Error> {
+        let io = &self.io;
+        let n = io
+            .async_io(Interest::WRITABLE, move || {
+                let last_send_error = self.last_send_error.clone();
+                send::<_, BATCH_SIZE>(state, SockRef::from(io), last_send_error, transmits)
+            })
+            .await?;
+
         // if n == transmits.len() {}
         Ok(n)
     }
@@ -218,34 +314,37 @@ impl UdpSocket {
         state: &UdpState,
         transmits: Transmit<B>,
     ) -> io::Result<usize> {
-        let n = loop {
-            self.io.writable().await?;
-            let io = &self.io;
-            match io.try_io(Interest::WRITABLE, || {
+        let io = &self.io;
+        let n = io
+            .async_io(Interest::WRITABLE, move || {
                 send_msg(state, SockRef::from(io), &transmits)
-            }) {
-                Ok(res) => break res,
-                Err(_would_block) => continue,
-            }
-        };
+            })
+            .await?;
+
         Ok(n)
     }
 
-    /// async version of `recvmmsg`
+    /// async version of `recvmmsg` with compile-time configurable batch size
     pub async fn recv_mmsg(
         &self,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> io::Result<usize> {
+        self.recv_mmsg_with_batch_size::<DEFAULT_BATCH_SIZE>(bufs, meta)
+            .await
+    }
+
+    pub async fn recv_mmsg_with_batch_size<const BATCH_SIZE: usize>(
+        &self,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> io::Result<usize> {
         debug_assert!(!bufs.is_empty());
-        loop {
-            self.io.readable().await?;
-            let io = &self.io;
-            match io.try_io(Interest::READABLE, || recv(SockRef::from(io), bufs, meta)) {
-                Ok(res) => return Ok(res),
-                Err(_would_block) => continue,
-            }
-        }
+        let io = &self.io;
+        io.async_io(Interest::READABLE | Interest::ERROR, || {
+            recv::<BATCH_SIZE>(SockRef::from(io), bufs, meta)
+        })
+        .await
     }
 
     /// `recv_msg` is similar to `recv_from` but returns extra information
@@ -255,14 +354,11 @@ impl UdpSocket {
     pub async fn recv_msg(&self, buf: &mut [u8]) -> io::Result<RecvMeta> {
         let mut iov = IoSliceMut::new(buf);
         debug_assert!(!iov.is_empty());
-        loop {
-            self.io.readable().await?;
-            let io = &self.io;
-            match io.try_io(Interest::READABLE, || recv_msg(SockRef::from(io), &mut iov)) {
-                Ok(res) => return Ok(res),
-                Err(_would_block) => continue,
-            }
-        }
+        let io = &self.io;
+        io.async_io(Interest::READABLE | Interest::ERROR, || {
+            recv_msg(SockRef::from(io), &mut iov)
+        })
+        .await
     }
 
     /// calls `sendmmsg`
@@ -272,18 +368,33 @@ impl UdpSocket {
         cx: &mut Context,
         transmits: &[Transmit<B>],
     ) -> Poll<io::Result<usize>> {
+        self.poll_send_mmsg_with_batch_size::<_, DEFAULT_BATCH_SIZE>(state, cx, transmits)
+    }
+
+    /// calls `sendmmsg`
+    pub fn poll_send_mmsg_with_batch_size<B: AsPtr<u8>, const BATCH_SIZE: usize>(
+        &mut self,
+        state: &UdpState,
+        cx: &mut Context,
+        transmits: &[Transmit<B>],
+    ) -> Poll<io::Result<usize>> {
         loop {
-            let last_send_error = &mut self.last_send_error;
             ready!(self.io.poll_send_ready(cx))?;
             let io = &self.io;
             if let Ok(res) = io.try_io(Interest::WRITABLE, || {
-                send(state, SockRef::from(io), last_send_error, transmits)
+                send::<_, BATCH_SIZE>(
+                    state,
+                    SockRef::from(io),
+                    self.last_send_error.clone(),
+                    transmits,
+                )
             }) {
                 return Poll::Ready(Ok(res));
             }
         }
     }
-    /// calls `sendmsg`
+
+    /// calls `sendmsg` with compile-time configurable batch size
     pub fn poll_send_msg<B: AsPtr<u8>>(
         &self,
         state: &UdpState,
@@ -323,11 +434,23 @@ impl UdpSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        self.poll_recv_mmsg_with_batch_size::<DEFAULT_BATCH_SIZE>(cx, bufs, meta)
+    }
+
+    /// calls `recvmmsg` with compile-time configurable batch size
+    pub fn poll_recv_mmsg_with_batch_size<const BATCH_SIZE: usize>(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
         debug_assert!(!bufs.is_empty());
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
             let io = &self.io;
-            if let Ok(res) = io.try_io(Interest::READABLE, || recv(SockRef::from(io), bufs, meta)) {
+            if let Ok(res) = io.try_io(Interest::READABLE, || {
+                recv::<BATCH_SIZE>(SockRef::from(io), bufs, meta)
+            }) {
                 return Poll::Ready(Ok(res));
             }
         }
@@ -348,7 +471,7 @@ pub mod sync {
     #[derive(Debug)]
     pub struct UdpSocket {
         io: std::net::UdpSocket,
-        last_send_error: Instant,
+        last_send_error: LastSendError,
     }
 
     impl AsRawFd for UdpSocket {
@@ -367,10 +490,9 @@ pub mod sync {
         pub fn from_std(socket: std::net::UdpSocket) -> io::Result<Self> {
             init(SockRef::from(&socket))?;
             socket.set_nonblocking(false)?;
-            let now = Instant::now();
             Ok(Self {
                 io: socket,
-                last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
+                last_send_error: LastSendError::default(),
             })
         }
         /// create a new UDP socket and attempt to bind to `addr`
@@ -378,10 +500,9 @@ pub mod sync {
             let io = std::net::UdpSocket::bind(addr)?;
             init(SockRef::from(&io))?;
             io.set_nonblocking(false)?;
-            let now = Instant::now();
             Ok(Self {
                 io,
-                last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
+                last_send_error: LastSendError::default(),
             })
         }
         /// sets nonblocking mode
@@ -457,8 +578,15 @@ pub mod sync {
         pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
             self.io.recv(buf)
         }
+
         /// Calls syscall [`sendmmsg`]. With a given `state` configured GSO and
-        /// `transmits` with information on the data and metadata about outgoing packets.
+        /// `transmits` with information on the data and metadata about outgoing
+        /// packets.
+        ///
+        /// Utilizes the default batch size (`DEFAULT_BATCH_SIZE`), and will
+        /// send no more than that number of messages. The caller must call this
+        /// fuction again after modifying `transmits` to continue sending the
+        /// entire set of messages.
         ///
         /// [`sendmmsg`]: https://linux.die.net/man/2/sendmmsg
         pub fn send_mmsg<B: AsPtr<u8>>(
@@ -466,13 +594,31 @@ pub mod sync {
             state: &UdpState,
             transmits: &[Transmit<B>],
         ) -> Result<usize, io::Error> {
-            send(
+            self.send_mmsg_with_batch_size::<_, DEFAULT_BATCH_SIZE>(state, transmits)
+        }
+
+        /// Calls syscall [`sendmmsg`]. With a given `state` configured GSO and
+        /// `transmits` with information on the data and metadata about outgoing packets.
+        ///
+        /// Sends no more than `BATCH_SIZE` messages. The caller must call this
+        /// fuction again after modifying `transmits` to continue sending the
+        /// entire set of messages. `BATCH_SIZE_CAP` defines the maximum that
+        /// will be sent, regardless of the specified `BATCH_SIZE`
+        ///
+        /// [`sendmmsg`]: https://linux.die.net/man/2/sendmmsg
+        pub fn send_mmsg_with_batch_size<B: AsPtr<u8>, const BATCH_SIZE: usize>(
+            &mut self,
+            state: &UdpState,
+            transmits: &[Transmit<B>],
+        ) -> Result<usize, io::Error> {
+            send::<_, BATCH_SIZE>(
                 state,
                 SockRef::from(&self.io),
-                &mut self.last_send_error,
+                self.last_send_error.clone(),
                 transmits,
             )
         }
+
         /// Calls syscall [`sendmsg`]. With a given `state` configured GSO and
         /// `transmit` with information on the data and metadata about outgoing packet.
         ///
@@ -491,8 +637,17 @@ pub mod sync {
             bufs: &mut [IoSliceMut<'_>],
             meta: &mut [RecvMeta],
         ) -> io::Result<usize> {
+            self.recv_mmsg_with_batch_size::<DEFAULT_BATCH_SIZE>(bufs, meta)
+        }
+
+        /// async version of `recvmmsg`, with compile-time configurable batch size
+        pub fn recv_mmsg_with_batch_size<const BATCH_SIZE: usize>(
+            &self,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> io::Result<usize> {
             debug_assert!(!bufs.is_empty());
-            recv(SockRef::from(&self.io), bufs, meta)
+            recv::<BATCH_SIZE>(SockRef::from(&self.io), bufs, meta)
         }
 
         /// `recv_msg` is similar to `recv_from` but returns extra information
@@ -565,9 +720,6 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        // opportunistically try to enable GRO. See gro::gro_segments().
-        let _ = set_socket_option(&*io, libc::SOL_UDP, libc::UDP_GRO, OPTION_ON);
-
         // Forbid IPv4 fragmentation. Set even for IPv6 to account for IPv6 mapped IPv4 addresses.
         set_socket_option(
             &*io,
@@ -587,13 +739,7 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
             )?;
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        if is_ipv4 {
-            set_socket_option(&*io, libc::IPPROTO_IP, libc::IP_PKTINFO, OPTION_ON)?;
-        }
-    }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     // IP_RECVDSTADDR == IP_SENDSRCADDR on FreeBSD
     // macOS uses only IP_RECVDSTADDR, no IP_SENDSRCADDR on macOS
     // macOS also supports IP_PKTINFO
@@ -614,7 +760,8 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn send_msg<B: AsPtr<u8>>(
-    state: &UdpState,
+    // `state` is not presently used on FreeBSD
+    #[allow(unused_variables)] state: &UdpState,
     io: SockRef<'_>,
     transmit: &Transmit<B>,
 ) -> io::Result<usize> {
@@ -673,10 +820,11 @@ fn send_msg<B: AsPtr<u8>>(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-fn send<B: AsPtr<u8>>(
-    state: &UdpState,
+fn send<B: AsPtr<u8>, const BATCH_SIZE: usize>(
+    // `state` is not presently used on FreeBSD
+    #[allow(unused_variables)] state: &UdpState,
     io: SockRef<'_>,
-    last_send_error: &mut Instant,
+    last_send_error: LastSendError,
     transmits: &[Transmit<B>],
 ) -> io::Result<usize> {
     use std::ptr;
@@ -708,8 +856,12 @@ fn send<B: AsPtr<u8>>(
     let num_transmits = transmits.len().min(BATCH_SIZE);
 
     loop {
+        #[cfg(target_os = "linux")]
         let n =
             unsafe { libc::sendmmsg(io.as_raw_fd(), msgs.as_mut_ptr(), num_transmits as u32, 0) };
+        #[cfg(target_os = "freebsd")]
+        let n =
+            unsafe { libc::sendmmsg(io.as_raw_fd(), msgs.as_mut_ptr(), num_transmits as usize, 0) };
         if n == -1 {
             let e = io::Error::last_os_error();
             match e.kind() {
@@ -794,10 +946,10 @@ fn send_msg<B: AsPtr<u8>>(
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn send<B: AsPtr<u8>>(
+fn send<B: AsPtr<u8>, const BATCH_SIZE: usize>(
     _state: &UdpState,
     io: SockRef<'_>,
-    last_send_error: &mut Instant,
+    last_send_error: LastSendError,
     transmits: &[Transmit<B>],
 ) -> io::Result<usize> {
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
@@ -823,7 +975,7 @@ fn send<B: AsPtr<u8>>(
                     //   Those are not fatal errors, since the
                     //   configuration can be dynamically changed.
                     // - Destination unreachable errors have been observed for other
-                    log_sendmsg_error(last_send_error, e, &transmits[sent]);
+                    log_sendmsg_error(last_send_error.clone(), e, &transmits[sent]);
                     sent += 1;
                 }
             }
@@ -835,7 +987,11 @@ fn send<B: AsPtr<u8>>(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+fn recv<const BATCH_SIZE: usize>(
+    io: SockRef<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+    meta: &mut [RecvMeta],
+) -> io::Result<usize> {
     use std::ptr;
 
     let mut names = [MaybeUninit::<libc::sockaddr_storage>::uninit(); BATCH_SIZE];
@@ -851,11 +1007,22 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         );
     }
     let msg_count = loop {
+        #[cfg(target_os = "linux")]
         let n = unsafe {
             libc::recvmmsg(
                 io.as_raw_fd(),
                 hdrs.as_mut_ptr(),
                 bufs.len().min(BATCH_SIZE) as libc::c_uint,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        #[cfg(target_os = "freebsd")]
+        let n = unsafe {
+            libc::recvmmsg(
+                io.as_raw_fd(),
+                hdrs.as_mut_ptr(),
+                bufs.len().min(BATCH_SIZE) as usize,
                 0,
                 ptr::null_mut(),
             )
@@ -901,7 +1068,11 @@ fn recv_msg(io: SockRef<'_>, bufs: &mut IoSliceMut<'_>) -> io::Result<RecvMeta> 
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+fn recv<const BATCH_SIZE: usize>(
+    io: SockRef<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+    meta: &mut [RecvMeta],
+) -> io::Result<usize> {
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
@@ -1024,6 +1195,7 @@ fn prepare_msg<B: AsPtr<u8>>(
                 };
                 encoder.push(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, pktinfo);
             }
+            #[cfg(not(target_os = "freebsd"))]
             Source::Interface(i) => {
                 let pktinfo = libc::in_pktinfo {
                     ipi_ifindex: *i as _, // i32 linux, u32 mac
@@ -1032,6 +1204,8 @@ fn prepare_msg<B: AsPtr<u8>>(
                 };
                 encoder.push(libc::IPPROTO_IP, libc::IP_PKTINFO, pktinfo);
             }
+            #[cfg(target_os = "freebsd")]
+            Source::Interface(_) => (), // Not yet supported on FreeBSD
             Source::InterfaceV6(i, ip) => {
                 let pktinfo = libc::in6_pktinfo {
                     ipi6_ifindex: *i,
@@ -1070,9 +1244,12 @@ fn decode_recv(
     let name = unsafe { name.assume_init() };
     let mut ecn_bits = 0;
     let mut dst_ip = None;
+    // Only mutated on Linux
+    #[allow(unused_mut)]
     let mut dst_local_ip = None;
     let mut ifindex = 0;
-    #[allow(unused_mut)] // only mutable on Linux
+    // Only mutated on Linux
+    #[allow(unused_mut)]
     let mut stride = len;
     let mut orig_dst = None;
 
@@ -1094,6 +1271,7 @@ fn decode_recv(
                     ecn_bits = cmsg::decode::<libc::c_int>(cmsg) as u8;
                 }
             },
+            #[cfg(target_os = "linux")]
             (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in_pktinfo>(cmsg) };
                 dst_ip = Some(IpAddr::V4(Ipv4Addr::from(
@@ -1104,13 +1282,19 @@ fn decode_recv(
                 )));
                 ifindex = pktinfo.ipi_ifindex as _;
             }
+            #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+            (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
+                let in_addr = unsafe { cmsg::decode::<libc::in_addr>(cmsg) };
+                let addr = IpAddr::V4(Ipv4Addr::from(in_addr.s_addr.to_ne_bytes()));
+                dst_ip = Some(addr);
+                dst_local_ip = Some(addr);
+            }
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in6_pktinfo>(cmsg) };
                 dst_ip = Some(IpAddr::V6(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr)));
                 ifindex = pktinfo.ipi6_ifindex;
             }
-            // freebsd doesn't have PKTINFO
-            #[cfg(target_os = "freebsd")]
+            #[cfg(any(target_os = "freebsd", target_os = "macos"))]
             (libc::IPPROTO_IP, libc::IP_RECVIF) => {
                 let info = unsafe { cmsg::decode::<libc::sockaddr_dl>(cmsg) };
                 ifindex = info.sdl_index as _;
@@ -1175,13 +1359,6 @@ fn decode_recv(
         orig_dst,
     }
 }
-
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
-// Chosen somewhat arbitrarily; might benefit from additional tuning.
-pub const BATCH_SIZE: usize = 32;
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub const BATCH_SIZE: usize = 1;
 
 #[cfg(target_os = "linux")]
 mod gso {
